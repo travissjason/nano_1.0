@@ -2116,3 +2116,23 @@ input {
 @media (prefers-reduced-motion: reduce) {
   *, *:before, *:after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+/* Audio controls use the existing palette and remain keyboard accessible. */
+.audio-panel { margin: 16px 0; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); font-size: 12px; }
+.audio-panel p { color: var(--muted); line-height: 1.7; }
+.audio-panel-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.audio-panel button { padding: 9px 12px; border: 1px solid var(--purple); border-radius: 8px; }
+.audio-panel .audio-mute { background: #a52b45; color: white; border-color: #ff879f; }
+.audio-setting { display: flex; align-items: center; gap: 8px; margin: 12px 0; }
+.audio-panel summary { cursor: pointer; padding: 10px 0; }
+.audio-panel dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.audio-panel dd { margin: 0; overflow-wrap: anywhere; }
+.audio-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto; }
+.audio-panel meter { width: 100px; }
+@media (max-width: 650px) {
+  .player-stage { grid-template-columns: minmax(0, 1fr); gap: 24px; padding: 20px 16px; }
+  .karaoke-panel { border-left: 0; border-top: 1px solid var(--line); padding: 20px 0 0; }
+  .audio-panel { padding: 12px; }
+  .audio-panel-actions > button { max-width: 100%; }
+  .audio-panel dl { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .topbar { padding-left: 12px; padding-right: 12px; gap: 8px; }
+}

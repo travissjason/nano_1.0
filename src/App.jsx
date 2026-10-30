@@ -32,136 +32,8 @@ import {
 import AlbumArt from "./AlbumArt.jsx";
 import { songs, timeLabel, readStored, writeStored } from "./data.js";
 
-// --- Web Audio API 실시간 DSP 헬퍼 함수 ---
-
-// 1. 인공 스테레오 리버브 임펄스 응답(Impulse Response) 생성
-function createReverbImpulse(ctx, duration = 2.4, decay = 2.8) {
-  const sampleRate = ctx.sampleRate;
-  const length = Math.floor(sampleRate * duration);
-  const impulse = ctx.createBuffer(2, length, sampleRate);
-  const left = impulse.getChannelData(0);
-  const right = impulse.getChannelData(1);
-
-  for (let i = 0; i < length; i++) {
-    const n = i / length;
-    const envelope = Math.pow(1 - n, decay);
-    left[i] = (Math.random() * 2 - 1) * envelope;
-    right[i] = (Math.random() * 2 - 1) * envelope;
-  }
-  return impulse;
-}
-
-// 2. 실시간 자기상관(Autocorrelation) 기반 보컬 피치(Hz) 검출
-function detectPitch(buf, sampleRate) {
-  let rms = 0;
-  for (let i = 0; i < buf.length; i++) {
-    rms += buf[i] * buf[i];
-  }
-  rms = Math.sqrt(rms / buf.length);
-  if (rms < 0.012) return -1; // 무음 구간 무시
-
-  const minLag = Math.floor(sampleRate / 750); // 최대 약 750Hz
-  const maxLag = Math.floor(sampleRate / 75);  // 최소 약 75Hz
-  let bestLag = -1;
-  let bestCorr = 0;
-
-  for (let lag = minLag; lag <= maxLag; lag += 2) {
-    let sum = 0;
-    for (let i = 0; i < buf.length - maxLag; i += 2) {
-      sum += buf[i] * buf[i + lag];
-    }
-    if (sum > bestCorr) {
-      bestCorr = sum;
-      bestLag = lag;
-    }
-  }
-  if (bestLag <= 0) return -1;
-  return sampleRate / bestLag;
-}
-
-// 3. 실시간 오토튠(피치 스내핑 + 로봇틱 배음 보정) DSP 노드 생성
-function createAutoTuneProcessor(ctx, enabledRef) {
-  const bufferSize = 1024;
-  const processor = ctx.createScriptProcessor(bufferSize, 1, 1);
-  const sampleRate = ctx.sampleRate;
-
-  const grainSize = Math.floor(sampleRate * 0.028); // 28ms 그레인 윈도우
-  const ringSize = grainSize * 4;
-  const delayBuffer = new Float32Array(ringSize);
-
-  let writeIdx = 0;
-  let phase = 0;
-  let smoothRatio = 1.0;
-  let synthPhase = 0;
-  let targetFreqHold = 220;
-
-  processor.onaudioprocess = (e) => {
-    const input = e.inputBuffer.getChannelData(0);
-    const output = e.outputBuffer.getChannelData(0);
-
-    if (!enabledRef.current) {
-      output.set(input);
-      return;
-    }
-
-    const detectedFreq = detectPitch(input, sampleRate);
-    let targetRatio = 1.0;
-
-    if (detectedFreq > 0) {
-      // 가장 가까운 반음(MIDI Note)으로 강제 스냅 (Hard Auto-Tune)
-      const midi = 69 + 12 * Math.log2(detectedFreq / 440);
-      const snappedMidi = Math.round(midi);
-      const snappedFreq = 440 * Math.pow(2, (snappedMidi - 69) / 12);
-      targetFreqHold = snappedFreq;
-      targetRatio = Math.max(0.75, Math.min(1.35, snappedFreq / detectedFreq));
-    }
-
-    // 빠른 반응 속도(Retune Speed)로 피치 비율 스무딩
-    smoothRatio = smoothRatio * 0.65 + targetRatio * 0.35;
-    const rate = 1.0 - smoothRatio;
-
-    for (let i = 0; i < input.length; i++) {
-      delayBuffer[writeIdx] = input[i];
-
-      phase += rate / grainSize;
-      phase = phase - Math.floor(phase);
-
-      const phase2 = (phase + 0.5) % 1.0;
-      const delay1 = phase * grainSize;
-      const delay2 = phase2 * grainSize;
-
-      const readPos1 = (writeIdx - delay1 + ringSize) % ringSize;
-      const readPos2 = (writeIdx - delay2 + ringSize) % ringSize;
-
-      const rInt1 = Math.floor(readPos1);
-      const rFrac1 = readPos1 - rInt1;
-      const s1 =
-        delayBuffer[rInt1] * (1 - rFrac1) +
-        delayBuffer[(rInt1 + 1) % ringSize] * rFrac1;
-
-      const rInt2 = Math.floor(readPos2);
-      const rFrac2 = readPos2 - rInt2;
-      const s2 =
-        delayBuffer[rInt2] * (1 - rFrac2) +
-        delayBuffer[(rInt2 + 1) % ringSize] * rFrac2;
-
-      // Hann Window 교차 페이드로 끊김 없는 피치 시프팅
-      const w1 = 0.5 * (1 - Math.cos(2 * Math.PI * phase));
-      const w2 = 0.5 * (1 - Math.cos(2 * Math.PI * phase2));
-      const shiftedSample = s1 * w1 + s2 * w2;
-
-      // 스냅된 목표 음정 주파수의 포먼트 배음을 살짝 블렌딩해 오토튠 질감 강화
-      synthPhase += (2 * Math.PI * targetFreqHold) / sampleRate;
-      if (synthPhase > 2 * Math.PI) synthPhase -= 2 * Math.PI;
-      const vocalSynth = shiftedSample * Math.sin(synthPhase);
-
-      output[i] = shiftedSample * 0.82 + vocalSynth * 0.18;
-      writeIdx = (writeIdx + 1) % ringSize;
-    }
-  };
-
-  return processor;
-}
+import { AudioEngine } from "./audio/AudioEngine.js";
+import AudioPanel from "./audio/AudioPanel.jsx";
 
 function Brand({ large = false }) {
   return (
@@ -223,23 +95,31 @@ export default function App() {
   const [playlistTab, setPlaylistTab] = useState("recent");
   const [help, setHelp] = useState(false);
   const [toast, setToast] = useState("");
-  const [volume, setVolume] = useState(85);
+  const [volume, setVolume] = useState(20);
   const toastTimer = useRef();
 
-  // Web Audio API 라우팅 그래프 관리 Ref
-  const audioRef = useRef({
-    ctx: null,
-    stream: null,
-    micGainNode: null,
-    reverbSendGain: null,
-    analyser: null,
-    rafId: null,
-  });
-  const autoTuneEnabledRef = useRef(false);
+  const engineRef = useRef(null);
+  if (!engineRef.current) engineRef.current = new AudioEngine();
+  const engine = engineRef.current;
+  const [diagnostics, setDiagnostics] = useState(() => engine.getAudioDiagnostics());
 
   useEffect(() => {
-    autoTuneEnabledRef.current = autoTune;
-  }, [autoTune]);
+    engine.onUpdate = (data) => {
+      setDiagnostics(data);
+      setMicLevel(Math.min(1, data.level * 4.5));
+      setAutoTune(data.autotune);
+      setReverb(data.reverb);
+      if (data.status === "stopped") {
+        setKaraoke(false);
+        setVolume(20);
+        setEffectorOpen(false);
+      }
+    };
+    return () => {
+      engine.onUpdate = () => {};
+      engine.cleanup();
+    };
+  }, [engine]);
 
   useEffect(() => {
     writeStored("nano-favorites", favorites);
@@ -251,35 +131,8 @@ export default function App() {
     writeStored("nano-sessions", saved);
   }, [saved]);
 
-  // 컴포넌트 언마운트 시 오디오 스트림 정리
-  useEffect(() => {
-    return () => {
-      clearTimeout(toastTimer.current);
-      stopMicrophoneEngine();
-    };
-  }, []);
-
-  // 실시간 마이크 증폭 볼륨 반영
-  useEffect(() => {
-    const { micGainNode, ctx } = audioRef.current;
-    if (micGainNode && ctx) {
-      // 0 ~ 150% 범위를 0.0 ~ 2.2배 증폭 게인으로 매핑
-      const gainValue = (volume / 100) * 1.5;
-      micGainNode.gain.setTargetAtTime(gainValue, ctx.currentTime, 0.03);
-    }
-  }, [volume]);
-
-  // 실시간 리버브(노래방 에코) Send 라우팅 게인 반영
-  useEffect(() => {
-    const { reverbSendGain, ctx } = audioRef.current;
-    if (reverbSendGain && ctx) {
-      reverbSendGain.gain.setTargetAtTime(
-        reverb ? 0.78 : 0.0,
-        ctx.currentTime,
-        0.05,
-      );
-    }
-  }, [reverb]);
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
+  useEffect(() => { engine.setMicrophoneGain(volume / 100); }, [engine, volume]);
 
   useEffect(() => {
     if (!playing || screen !== "player") return;
@@ -309,151 +162,24 @@ export default function App() {
     toastTimer.current = setTimeout(() => setToast(""), 3000);
   }
 
-  // 실시간 마이크 입력 + DSP 오디오 라우팅 엔진 시작
   async function startMicrophoneEngine() {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          latency: 0,
-        },
-      });
-
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AudioCtx({ latencyHint: "interactive" });
-      if (ctx.state === "suspended") {
-        await ctx.resume();
-      }
-
-      const source = ctx.createMediaStreamSource(stream);
-
-      // 1. 저역 팝 노이즈 제거용 하이패스 필터 (85Hz)
-      const hpFilter = ctx.createBiquadFilter();
-      hpFilter.type = "highpass";
-      hpFilter.frequency.value = 85;
-
-      // 2. 보컬 다이나믹 정리용 컴프레서
-      const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -22;
-      compressor.knee.value = 18;
-      compressor.ratio.value = 4;
-      compressor.attack.value = 0.005;
-      compressor.release.value = 0.15;
-
-      // 3. 직렬(Insert) 오토튠 DSP 노드
-      const autoTuneNode = createAutoTuneProcessor(ctx, autoTuneEnabledRef);
-
-      // 4. 마이크 메인 증폭 볼륨 (Master Mic Gain)
-      const micGainNode = ctx.createGain();
-      micGainNode.gain.value = (volume / 100) * 1.5;
-
-      // 5. 병렬(Send/Return) 리버브 & 노래방 에코 체인
-      const reverbSendGain = ctx.createGain();
-      reverbSendGain.gain.value = reverb ? 0.78 : 0.0;
-
-      // 노래방 특유의 슬랩백 에코 딜레이 + 피드백
-      const preDelay = ctx.createDelay(0.5);
-      preDelay.delayTime.value = 0.11;
-      const echoFeedback = ctx.createGain();
-      echoFeedback.gain.value = 0.32;
-      preDelay.connect(echoFeedback);
-      echoFeedback.connect(preDelay);
-
-      // 공간 잔향 ConvolverNode
-      const convolver = ctx.createConvolver();
-      convolver.buffer = createReverbImpulse(ctx, 2.4, 2.8);
-
-      // 리버브 고음역 다듬기 필터
-      const reverbTone = ctx.createBiquadFilter();
-      reverbTone.type = "lowpass";
-      reverbTone.frequency.value = 4200;
-
-      // 6. 실시간 음량 시각화용 AnalyserNode
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-      // --- 오디오 라우팅(Signal Flow) 연결 ---
-      // [직렬 인서트 경로]: 마이크 -> 하이패스 -> 컴프레서 -> 오토튠 -> 마이크 볼륨
-      source.connect(hpFilter);
-      hpFilter.connect(compressor);
-      compressor.connect(autoTuneNode);
-      autoTuneNode.connect(micGainNode);
-
-      // [Dry 출력 경로]: 마이크 볼륨 -> Analyser -> 스피커(Destination)
-      micGainNode.connect(analyser);
-      micGainNode.connect(ctx.destination);
-
-      // [병렬 리버브 Send 경로]: 마이크 볼륨 -> 리버브 Send -> 딜레이/컨볼버 -> 스피커
-      micGainNode.connect(reverbSendGain);
-      reverbSendGain.connect(preDelay);
-      preDelay.connect(convolver);
-      convolver.connect(reverbTone);
-      reverbTone.connect(ctx.destination);
-
-      const updateMeter = () => {
-        analyser.getByteTimeDomainData(dataArray);
-        let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) {
-          const norm = (dataArray[i] - 128) / 128;
-          sum += norm * norm;
-        }
-        const rms = Math.sqrt(sum / dataArray.length);
-        setMicLevel(Math.min(1, rms * 4.5));
-        audioRef.current.rafId = requestAnimationFrame(updateMeter);
-      };
-      const rafId = requestAnimationFrame(updateMeter);
-
-      audioRef.current = {
-        ctx,
-        stream,
-        micGainNode,
-        reverbSendGain,
-        analyser,
-        rafId,
-      };
-
-      notify("실시간 마이크 증폭이 켜졌어요. 하울링 방지를 위해 이어폰을 권장해요!");
-      return true;
-    } catch (err) {
-      notify("마이크 권한을 허용해야 실시간 노래방 기능을 쓸 수 있어요");
-      return false;
-    }
+    setVolume(20);
+    const ok = await engine.startMicrophone();
+    if (ok) notify("마이크가 켜졌어요. 초기 게인 0.2 · 유선 헤드폰으로 먼저 테스트하세요.");
+    return ok;
   }
 
-  function stopMicrophoneEngine() {
-    const { ctx, stream, rafId } = audioRef.current;
-    if (rafId) cancelAnimationFrame(rafId);
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
-    }
-    if (ctx && ctx.state !== "closed") {
-      ctx.close().catch(() => {});
-    }
-    audioRef.current = {
-      ctx: null,
-      stream: null,
-      micGainNode: null,
-      reverbSendGain: null,
-      analyser: null,
-      rafId: null,
-    };
-    setMicLevel(0);
-  }
+  function stopMicrophoneEngine() { engine.stopMicrophone(); }
 
   function navigate(next) {
     setScreen(next);
     if (next !== "player") {
       setPlaying(false);
-      if (karaoke) {
-        stopMicrophoneEngine();
-        setKaraoke(false);
-        setReverb(false);
-        setAutoTune(false);
-        setEffectorOpen(false);
-      }
+      stopMicrophoneEngine();
+      setKaraoke(false);
+      setReverb(false);
+      setAutoTune(false);
+      setEffectorOpen(false);
     }
     window.scrollTo({ top: 0 });
   }
@@ -1086,11 +812,11 @@ export default function App() {
                   {/* 실시간 마이크 증폭 볼륨 컨트롤 */}
                   <label className="volume-control">
                     <Volume2 size={16} />
-                    <span>마이크 증폭</span>
+                    <span>마이크 게인</span>
                     <input
                       type="range"
                       min="0"
-                      max="150"
+                      max="100"
                       value={volume}
                       onChange={(e) => setVolume(Number(e.target.value))}
                       aria-label="실시간 마이크 증폭 볼륨"
@@ -1169,7 +895,7 @@ export default function App() {
                       <div className="effector-options">
                         <button
                           className={`effector-chip ${reverb ? "active reverb-chip" : ""}`}
-                          onClick={() => setReverb(!reverb)}
+                          onClick={() => engine.setReverb(!reverb)}
                           aria-pressed={reverb}
                         >
                           <Waves size={18} />
@@ -1182,7 +908,7 @@ export default function App() {
                         </button>
                         <button
                           className={`effector-chip ${autoTune ? "active autotune-chip" : ""}`}
-                          onClick={() => setAutoTune(!autoTune)}
+                          onClick={() => engine.setAutotune(!autoTune)}
                           aria-pressed={autoTune}
                         >
                           <Sparkles size={18} />
@@ -1197,10 +923,12 @@ export default function App() {
                     </div>
                   )}
 
+                  <AudioPanel engine={engine} diagnostics={diagnostics} />
                   <div className="effect-controls">
                     <button
                       className={`effect-button ${karaoke ? "enabled" : ""}`}
                       onClick={toggleKaraoke}
+                      disabled={diagnostics.status === "starting"}
                       aria-pressed={karaoke}
                     >
                       <div className="effect-icon">
