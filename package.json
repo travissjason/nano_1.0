@@ -7,7 +7,8 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "export:demo": "npm run build && node scripts/export-demo.mjs"
+    "export:demo": "npm run build && node scripts/export-demo.mjs",
+    "test:audio": "node --loader ./tests/raw-loader.js ./tests/audio.test.js"
   },
   "dependencies": {
     "@fontsource-variable/noto-sans-kr": "5.3.1",
