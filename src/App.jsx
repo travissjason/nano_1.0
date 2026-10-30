@@ -22,6 +22,7 @@ import {
   ShieldCheck,
   SkipBack,
   SkipForward,
+  Sliders,
   Sparkles,
   Square,
   Volume2,
@@ -30,6 +31,137 @@ import {
 } from "lucide-react";
 import AlbumArt from "./AlbumArt.jsx";
 import { songs, timeLabel, readStored, writeStored } from "./data.js";
+
+// --- Web Audio API 실시간 DSP 헬퍼 함수 ---
+
+// 1. 인공 스테레오 리버브 임펄스 응답(Impulse Response) 생성
+function createReverbImpulse(ctx, duration = 2.4, decay = 2.8) {
+  const sampleRate = ctx.sampleRate;
+  const length = Math.floor(sampleRate * duration);
+  const impulse = ctx.createBuffer(2, length, sampleRate);
+  const left = impulse.getChannelData(0);
+  const right = impulse.getChannelData(1);
+
+  for (let i = 0; i < length; i++) {
+    const n = i / length;
+    const envelope = Math.pow(1 - n, decay);
+    left[i] = (Math.random() * 2 - 1) * envelope;
+    right[i] = (Math.random() * 2 - 1) * envelope;
+  }
+  return impulse;
+}
+
+// 2. 실시간 자기상관(Autocorrelation) 기반 보컬 피치(Hz) 검출
+function detectPitch(buf, sampleRate) {
+  let rms = 0;
+  for (let i = 0; i < buf.length; i++) {
+    rms += buf[i] * buf[i];
+  }
+  rms = Math.sqrt(rms / buf.length);
+  if (rms < 0.012) return -1; // 무음 구간 무시
+
+  const minLag = Math.floor(sampleRate / 750); // 최대 약 750Hz
+  const maxLag = Math.floor(sampleRate / 75);  // 최소 약 75Hz
+  let bestLag = -1;
+  let bestCorr = 0;
+
+  for (let lag = minLag; lag <= maxLag; lag += 2) {
+    let sum = 0;
+    for (let i = 0; i < buf.length - maxLag; i += 2) {
+      sum += buf[i] * buf[i + lag];
+    }
+    if (sum > bestCorr) {
+      bestCorr = sum;
+      bestLag = lag;
+    }
+  }
+  if (bestLag <= 0) return -1;
+  return sampleRate / bestLag;
+}
+
+// 3. 실시간 오토튠(피치 스내핑 + 로봇틱 배음 보정) DSP 노드 생성
+function createAutoTuneProcessor(ctx, enabledRef) {
+  const bufferSize = 1024;
+  const processor = ctx.createScriptProcessor(bufferSize, 1, 1);
+  const sampleRate = ctx.sampleRate;
+
+  const grainSize = Math.floor(sampleRate * 0.028); // 28ms 그레인 윈도우
+  const ringSize = grainSize * 4;
+  const delayBuffer = new Float32Array(ringSize);
+
+  let writeIdx = 0;
+  let phase = 0;
+  let smoothRatio = 1.0;
+  let synthPhase = 0;
+  let targetFreqHold = 220;
+
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const output = e.outputBuffer.getChannelData(0);
+
+    if (!enabledRef.current) {
+      output.set(input);
+      return;
+    }
+
+    const detectedFreq = detectPitch(input, sampleRate);
+    let targetRatio = 1.0;
+
+    if (detectedFreq > 0) {
+      // 가장 가까운 반음(MIDI Note)으로 강제 스냅 (Hard Auto-Tune)
+      const midi = 69 + 12 * Math.log2(detectedFreq / 440);
+      const snappedMidi = Math.round(midi);
+      const snappedFreq = 440 * Math.pow(2, (snappedMidi - 69) / 12);
+      targetFreqHold = snappedFreq;
+      targetRatio = Math.max(0.75, Math.min(1.35, snappedFreq / detectedFreq));
+    }
+
+    // 빠른 반응 속도(Retune Speed)로 피치 비율 스무딩
+    smoothRatio = smoothRatio * 0.65 + targetRatio * 0.35;
+    const rate = 1.0 - smoothRatio;
+
+    for (let i = 0; i < input.length; i++) {
+      delayBuffer[writeIdx] = input[i];
+
+      phase += rate / grainSize;
+      phase = phase - Math.floor(phase);
+
+      const phase2 = (phase + 0.5) % 1.0;
+      const delay1 = phase * grainSize;
+      const delay2 = phase2 * grainSize;
+
+      const readPos1 = (writeIdx - delay1 + ringSize) % ringSize;
+      const readPos2 = (writeIdx - delay2 + ringSize) % ringSize;
+
+      const rInt1 = Math.floor(readPos1);
+      const rFrac1 = readPos1 - rInt1;
+      const s1 =
+        delayBuffer[rInt1] * (1 - rFrac1) +
+        delayBuffer[(rInt1 + 1) % ringSize] * rFrac1;
+
+      const rInt2 = Math.floor(readPos2);
+      const rFrac2 = readPos2 - rInt2;
+      const s2 =
+        delayBuffer[rInt2] * (1 - rFrac2) +
+        delayBuffer[(rInt2 + 1) % ringSize] * rFrac2;
+
+      // Hann Window 교차 페이드로 끊김 없는 피치 시프팅
+      const w1 = 0.5 * (1 - Math.cos(2 * Math.PI * phase));
+      const w2 = 0.5 * (1 - Math.cos(2 * Math.PI * phase2));
+      const shiftedSample = s1 * w1 + s2 * w2;
+
+      // 스냅된 목표 음정 주파수의 포먼트 배음을 살짝 블렌딩해 오토튠 질감 강화
+      synthPhase += (2 * Math.PI * targetFreqHold) / sampleRate;
+      if (synthPhase > 2 * Math.PI) synthPhase -= 2 * Math.PI;
+      const vocalSynth = shiftedSample * Math.sin(synthPhase);
+
+      output[i] = shiftedSample * 0.82 + vocalSynth * 0.18;
+      writeIdx = (writeIdx + 1) % ringSize;
+    }
+  };
+
+  return processor;
+}
 
 function Brand({ large = false }) {
   return (
@@ -49,10 +181,11 @@ function Brand({ large = false }) {
   );
 }
 
-function Waveform({ active = false, small = false }) {
+function Waveform({ active = false, small = false, level = 0 }) {
   return (
     <div
       className={`waveform ${active ? "active" : ""} ${small ? "small" : ""}`}
+      style={{ "--mic-boost": active && level > 0 ? 0.35 + level * 1.15 : 1 }}
       aria-hidden="true"
     >
       {Array.from({ length: small ? 16 : 44 }, (_, i) => (
@@ -75,6 +208,9 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [karaoke, setKaraoke] = useState(false);
   const [reverb, setReverb] = useState(false);
+  const [autoTune, setAutoTune] = useState(false);
+  const [effectorOpen, setEffectorOpen] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("전체");
   const [favorites, setFavorites] = useState(() =>
@@ -87,8 +223,23 @@ export default function App() {
   const [playlistTab, setPlaylistTab] = useState("recent");
   const [help, setHelp] = useState(false);
   const [toast, setToast] = useState("");
-  const [volume, setVolume] = useState(72);
+  const [volume, setVolume] = useState(85);
   const toastTimer = useRef();
+
+  // Web Audio API 라우팅 그래프 관리 Ref
+  const audioRef = useRef({
+    ctx: null,
+    stream: null,
+    micGainNode: null,
+    reverbSendGain: null,
+    analyser: null,
+    rafId: null,
+  });
+  const autoTuneEnabledRef = useRef(false);
+
+  useEffect(() => {
+    autoTuneEnabledRef.current = autoTune;
+  }, [autoTune]);
 
   useEffect(() => {
     writeStored("nano-favorites", favorites);
@@ -99,7 +250,37 @@ export default function App() {
   useEffect(() => {
     writeStored("nano-sessions", saved);
   }, [saved]);
-  useEffect(() => () => clearTimeout(toastTimer.current), []);
+
+  // 컴포넌트 언마운트 시 오디오 스트림 정리
+  useEffect(() => {
+    return () => {
+      clearTimeout(toastTimer.current);
+      stopMicrophoneEngine();
+    };
+  }, []);
+
+  // 실시간 마이크 증폭 볼륨 반영
+  useEffect(() => {
+    const { micGainNode, ctx } = audioRef.current;
+    if (micGainNode && ctx) {
+      // 0 ~ 150% 범위를 0.0 ~ 2.2배 증폭 게인으로 매핑
+      const gainValue = (volume / 100) * 1.5;
+      micGainNode.gain.setTargetAtTime(gainValue, ctx.currentTime, 0.03);
+    }
+  }, [volume]);
+
+  // 실시간 리버브(노래방 에코) Send 라우팅 게인 반영
+  useEffect(() => {
+    const { reverbSendGain, ctx } = audioRef.current;
+    if (reverbSendGain && ctx) {
+      reverbSendGain.gain.setTargetAtTime(
+        reverb ? 0.78 : 0.0,
+        ctx.currentTime,
+        0.05,
+      );
+    }
+  }, [reverb]);
+
   useEffect(() => {
     if (!playing || screen !== "player") return;
     const timer = setInterval(
@@ -108,9 +289,11 @@ export default function App() {
     );
     return () => clearInterval(timer);
   }, [playing, screen, song.duration]);
+
   useEffect(() => {
     if (screen === "player" && progress >= song.duration) finishSession();
   }, [progress, screen, song.duration]);
+
   useEffect(() => {
     if (!help) return;
     const listener = (e) => {
@@ -125,11 +308,156 @@ export default function App() {
     clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(""), 3000);
   }
+
+  // 실시간 마이크 입력 + DSP 오디오 라우팅 엔진 시작
+  async function startMicrophoneEngine() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          latency: 0,
+        },
+      });
+
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AudioCtx({ latencyHint: "interactive" });
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+
+      const source = ctx.createMediaStreamSource(stream);
+
+      // 1. 저역 팝 노이즈 제거용 하이패스 필터 (85Hz)
+      const hpFilter = ctx.createBiquadFilter();
+      hpFilter.type = "highpass";
+      hpFilter.frequency.value = 85;
+
+      // 2. 보컬 다이나믹 정리용 컴프레서
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.value = -22;
+      compressor.knee.value = 18;
+      compressor.ratio.value = 4;
+      compressor.attack.value = 0.005;
+      compressor.release.value = 0.15;
+
+      // 3. 직렬(Insert) 오토튠 DSP 노드
+      const autoTuneNode = createAutoTuneProcessor(ctx, autoTuneEnabledRef);
+
+      // 4. 마이크 메인 증폭 볼륨 (Master Mic Gain)
+      const micGainNode = ctx.createGain();
+      micGainNode.gain.value = (volume / 100) * 1.5;
+
+      // 5. 병렬(Send/Return) 리버브 & 노래방 에코 체인
+      const reverbSendGain = ctx.createGain();
+      reverbSendGain.gain.value = reverb ? 0.78 : 0.0;
+
+      // 노래방 특유의 슬랩백 에코 딜레이 + 피드백
+      const preDelay = ctx.createDelay(0.5);
+      preDelay.delayTime.value = 0.11;
+      const echoFeedback = ctx.createGain();
+      echoFeedback.gain.value = 0.32;
+      preDelay.connect(echoFeedback);
+      echoFeedback.connect(preDelay);
+
+      // 공간 잔향 ConvolverNode
+      const convolver = ctx.createConvolver();
+      convolver.buffer = createReverbImpulse(ctx, 2.4, 2.8);
+
+      // 리버브 고음역 다듬기 필터
+      const reverbTone = ctx.createBiquadFilter();
+      reverbTone.type = "lowpass";
+      reverbTone.frequency.value = 4200;
+
+      // 6. 실시간 음량 시각화용 AnalyserNode
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+      // --- 오디오 라우팅(Signal Flow) 연결 ---
+      // [직렬 인서트 경로]: 마이크 -> 하이패스 -> 컴프레서 -> 오토튠 -> 마이크 볼륨
+      source.connect(hpFilter);
+      hpFilter.connect(compressor);
+      compressor.connect(autoTuneNode);
+      autoTuneNode.connect(micGainNode);
+
+      // [Dry 출력 경로]: 마이크 볼륨 -> Analyser -> 스피커(Destination)
+      micGainNode.connect(analyser);
+      micGainNode.connect(ctx.destination);
+
+      // [병렬 리버브 Send 경로]: 마이크 볼륨 -> 리버브 Send -> 딜레이/컨볼버 -> 스피커
+      micGainNode.connect(reverbSendGain);
+      reverbSendGain.connect(preDelay);
+      preDelay.connect(convolver);
+      convolver.connect(reverbTone);
+      reverbTone.connect(ctx.destination);
+
+      const updateMeter = () => {
+        analyser.getByteTimeDomainData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          const norm = (dataArray[i] - 128) / 128;
+          sum += norm * norm;
+        }
+        const rms = Math.sqrt(sum / dataArray.length);
+        setMicLevel(Math.min(1, rms * 4.5));
+        audioRef.current.rafId = requestAnimationFrame(updateMeter);
+      };
+      const rafId = requestAnimationFrame(updateMeter);
+
+      audioRef.current = {
+        ctx,
+        stream,
+        micGainNode,
+        reverbSendGain,
+        analyser,
+        rafId,
+      };
+
+      notify("실시간 마이크 증폭이 켜졌어요. 하울링 방지를 위해 이어폰을 권장해요!");
+      return true;
+    } catch (err) {
+      notify("마이크 권한을 허용해야 실시간 노래방 기능을 쓸 수 있어요");
+      return false;
+    }
+  }
+
+  function stopMicrophoneEngine() {
+    const { ctx, stream, rafId } = audioRef.current;
+    if (rafId) cancelAnimationFrame(rafId);
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+    }
+    if (ctx && ctx.state !== "closed") {
+      ctx.close().catch(() => {});
+    }
+    audioRef.current = {
+      ctx: null,
+      stream: null,
+      micGainNode: null,
+      reverbSendGain: null,
+      analyser: null,
+      rafId: null,
+    };
+    setMicLevel(0);
+  }
+
   function navigate(next) {
     setScreen(next);
-    if (next !== "player") setPlaying(false);
+    if (next !== "player") {
+      setPlaying(false);
+      if (karaoke) {
+        stopMicrophoneEngine();
+        setKaraoke(false);
+        setReverb(false);
+        setAutoTune(false);
+        setEffectorOpen(false);
+      }
+    }
     window.scrollTo({ top: 0 });
   }
+
   function startSong(selected) {
     setSong(selected);
     setProgress(0);
@@ -141,6 +469,7 @@ export default function App() {
     setScreen("player");
     window.scrollTo({ top: 0 });
   }
+
   function nextSong(direction) {
     startSong(
       songs[
@@ -149,6 +478,7 @@ export default function App() {
       ],
     );
   }
+
   function toggleFavorite(selected) {
     const has = favorites.includes(selected.id);
     setFavorites((old) =>
@@ -156,29 +486,52 @@ export default function App() {
     );
     notify(has ? "즐겨찾기에서 삭제했어요" : "즐겨찾기에 담았어요");
   }
-  function toggleKaraoke() {
-    setKaraoke(!karaoke);
-    if (karaoke) setReverb(false);
+
+  async function toggleKaraoke() {
+    if (!karaoke) {
+      const ok = await startMicrophoneEngine();
+      if (ok) {
+        setKaraoke(true);
+      }
+    } else {
+      stopMicrophoneEngine();
+      setKaraoke(false);
+      setReverb(false);
+      setAutoTune(false);
+      setEffectorOpen(false);
+      notify("노래방 모드를 종료했어요");
+    }
   }
+
   function finishSession() {
     setPlaying(false);
+    stopMicrophoneEngine();
     setSession({
       id: Date.now(),
       songId: song.id,
       duration: progress,
       karaoke,
       reverb,
+      autoTune,
       date: new Date().toISOString(),
     });
+    setKaraoke(false);
+    setReverb(false);
+    setAutoTune(false);
+    setEffectorOpen(false);
     setSessionSaved(false);
     setScreen("result");
   }
+
   function saveSession() {
     if (sessionSaved || !session) return;
     setSaved((old) => [session, ...old].slice(0, 20));
     setSessionSaved(true);
     notify("이 브라우저에 세션 기록을 저장했어요");
   }
+
+  const activeEffectsCount = (reverb ? 1 : 0) + (autoTune ? 1 : 0);
+  const anyEffectOn = activeEffectsCount > 0;
 
   const filtered = songs.filter(
     (s) =>
@@ -603,7 +956,7 @@ export default function App() {
                     <span className="count">{filtered.length}</span>
                   </h2>
                   <span className="demo-music-label">
-                    시연용 오리지널 곡 <span>·</span> 오디오 미포함
+                    시연용 오리지널 곡 <span>·</span> 실시간 마이크 DSP 지원
                   </span>
                 </div>
                 {filtered.map((s, i) => (
@@ -654,7 +1007,7 @@ export default function App() {
                 </button>
                 <span className={`mode-pill ${karaoke ? "on" : ""}`}>
                   <span className="live-dot" />
-                  {karaoke ? "NANO MODE ON" : "MUSIC MODE"}
+                  {karaoke ? "LIVE MIC DSP ON" : "MUSIC MODE"}
                 </span>
                 <button
                   className="text-button finish-button"
@@ -664,7 +1017,7 @@ export default function App() {
                 </button>
               </div>
               <section
-                className={`player-stage ${karaoke ? "karaoke-on" : ""} ${reverb ? "reverb-on" : ""}`}
+                className={`player-stage ${karaoke ? "karaoke-on" : ""} ${reverb ? "reverb-on" : ""} ${autoTune ? "autotune-on" : ""}`}
               >
                 <div className="now-playing">
                   <div className="eyebrow muted">YOUR MOMENT, YOUR MUSIC</div>
@@ -729,25 +1082,31 @@ export default function App() {
                       <SkipForward size={24} fill="currentColor" />
                     </button>
                   </div>
+
+                  {/* 실시간 마이크 증폭 볼륨 컨트롤 */}
                   <label className="volume-control">
                     <Volume2 size={16} />
+                    <span>마이크 증폭</span>
                     <input
                       type="range"
                       min="0"
-                      max="100"
+                      max="150"
                       value={volume}
                       onChange={(e) => setVolume(Number(e.target.value))}
-                      aria-label="데모 볼륨"
+                      aria-label="실시간 마이크 증폭 볼륨"
                     />
                     <span>{volume}%</span>
                   </label>
                 </div>
+
                 <div className="karaoke-panel">
                   <div className="lyrics-heading">
                     <span className="eyebrow">
                       {karaoke ? "SING IT YOUR WAY" : "FEEL THE MUSIC"}
                     </span>
-                    <span className="demo-badge">LYRICS DEMO</span>
+                    <span className="demo-badge">
+                      {karaoke ? "REAL-TIME DSP ACTIVE" : "LYRICS DEMO"}
+                    </span>
                   </div>
                   <div className="lyrics" aria-live="off">
                     {song.lyrics.map((line, i) => {
@@ -771,15 +1130,73 @@ export default function App() {
                     })}
                   </div>
                   <div className="mode-visual">
-                    <Waveform active={playing && karaoke} />
+                    <Waveform
+                      active={karaoke && (playing || micLevel > 0.04)}
+                      level={micLevel}
+                    />
                     <span>
-                      {reverb
-                        ? "공간을 채우는, 나만의 울림"
-                        : karaoke
-                          ? "당신의 목소리로 채워보세요"
-                          : "좋아하는 음악에 나를 맡기는 시간"}
+                      {reverb && autoTune
+                        ? "리버브 & 오토튠이 목소리를 감싸는 중"
+                        : autoTune
+                          ? "실시간 오토튠 피치 보정 적용 중"
+                          : reverb
+                            ? "공간을 채우는, 나만의 리버브 에코"
+                            : karaoke
+                              ? `마이크 입력 감지 중 (${Math.round(micLevel * 100)}%)`
+                              : "좋아하는 음악에 나를 맡기는 시간"}
                     </span>
                   </div>
+
+                  {/* 이펙터 선택 팝업/드로어 (이펙터 버튼 클릭 시 오픈) */}
+                  {karaoke && effectorOpen && (
+                    <div
+                      className="effector-drawer"
+                      role="region"
+                      aria-label="보컬 이펙터 선택"
+                    >
+                      <div className="effector-drawer-header">
+                        <span>
+                          <Sliders size={13} /> 보컬 이펙터 (DSP EFFECTORS)
+                        </span>
+                        <button
+                          className="icon-button drawer-close"
+                          onClick={() => setEffectorOpen(false)}
+                          aria-label="이펙터 선택창 닫기"
+                        >
+                          <X size={15} />
+                        </button>
+                      </div>
+                      <div className="effector-options">
+                        <button
+                          className={`effector-chip ${reverb ? "active reverb-chip" : ""}`}
+                          onClick={() => setReverb(!reverb)}
+                          aria-pressed={reverb}
+                        >
+                          <Waves size={18} />
+                          <div>
+                            <strong>
+                              리버브 <span>{reverb ? "ON" : "OFF"}</span>
+                            </strong>
+                            <small>노래방 에코 · 공간 잔향</small>
+                          </div>
+                        </button>
+                        <button
+                          className={`effector-chip ${autoTune ? "active autotune-chip" : ""}`}
+                          onClick={() => setAutoTune(!autoTune)}
+                          aria-pressed={autoTune}
+                        >
+                          <Sparkles size={18} />
+                          <div>
+                            <strong>
+                              오토튠 <span>{autoTune ? "ON" : "OFF"}</span>
+                            </strong>
+                            <small>실시간 음정 스냅 보정</small>
+                          </div>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="effect-controls">
                     <button
                       className={`effect-button ${karaoke ? "enabled" : ""}`}
@@ -795,33 +1212,41 @@ export default function App() {
                         </strong>
                         <small>
                           {karaoke
-                            ? "마이크 증폭 활성화"
-                            : "나만의 무대를 켜보세요"}
+                            ? `실시간 마이크 증폭 (${volume}%)`
+                            : "내 목소리를 스피커로 출력"}
                         </small>
                       </div>
                       <span className="toggle-track">
                         <i />
                       </span>
                     </button>
+
                     <button
-                      className={`effect-button ${reverb ? "enabled reverb-enabled" : ""}`}
+                      className={`effect-button ${anyEffectOn ? "enabled reverb-enabled" : ""} ${effectorOpen ? "drawer-open" : ""}`}
                       disabled={!karaoke}
-                      onClick={() => setReverb(!reverb)}
-                      aria-pressed={reverb}
+                      onClick={() => setEffectorOpen(!effectorOpen)}
+                      aria-expanded={effectorOpen}
                     >
                       <div className="effect-icon">
-                        <Waves size={25} />
+                        <Sliders size={25} />
                       </div>
                       <div className="effect-copy">
                         <strong>
-                          리버브 <span>{reverb ? "ON" : "OFF"}</span>
+                          이펙터{" "}
+                          <span>
+                            {anyEffectOn ? `${activeEffectsCount} ON` : "OFF"}
+                          </span>
                         </strong>
                         <small>
-                          {reverb
-                            ? "리버브 효과 적용 중"
-                            : karaoke
-                              ? "목소리에 공간감을 더해요"
-                              : "노래방 모드를 먼저 켜주세요"}
+                          {!karaoke
+                            ? "노래방 모드를 먼저 켜주세요"
+                            : reverb && autoTune
+                              ? "리버브 · 오토튠 적용 중"
+                              : reverb
+                                ? "리버브(에코) 적용 중"
+                                : autoTune
+                                  ? "오토튠 피치 보정 중"
+                                  : "눌러서 리버브 · 오토튠 선택"}
                         </small>
                       </div>
                       <span className="toggle-track">
@@ -829,20 +1254,19 @@ export default function App() {
                       </span>
                     </button>
                   </div>
+
                   <p className="mode-description" aria-live="polite">
-                    {reverb ? (
+                    {karaoke ? (
                       <>
-                        <Waves size={14} /> 노래방 모드 ON · 마이크 증폭 활성화
-                        · 리버브 효과 적용 중
-                      </>
-                    ) : karaoke ? (
-                      <>
-                        <Mic2 size={14} /> 노래방 모드 ON · 마이크 증폭 활성화
+                        <Mic2 size={14} /> 실시간 마이크 출력 중 · 볼륨 {volume}
+                        %
+                        {reverb ? " · 리버브 ON" : ""}
+                        {autoTune ? " · 오토튠 ON" : ""}
                       </>
                     ) : (
                       <>
                         <Headphones size={14} /> 일반 음악 모드 · 노래방 버튼을
-                        눌러 시작하세요
+                        누르면 마이크 소리가 증폭됩니다
                       </>
                     )}
                   </p>
@@ -854,7 +1278,8 @@ export default function App() {
                   있습니다.
                 </span>
                 <span>
-                  UI 시연 모드 · 실제 오디오 및 마이크 처리는 제공하지 않습니다.
+                  스피커 사용 시 하울링(피드백)이 발생할 수 있으니 이어폰/헤드폰
+                  착용이나 적절한 볼륨 조절을 권장합니다.
                 </span>
               </div>
             </>
@@ -883,6 +1308,7 @@ export default function App() {
                     </span>
                     <span>{session.karaoke ? "노래방 모드" : "음악 모드"}</span>
                     {session.reverb && <span>리버브 ON</span>}
+                    {session.autoTune && <span>오토튠 ON</span>}
                   </div>
                 </div>
                 <Waveform small />
@@ -947,6 +1373,7 @@ export default function App() {
                             {track.artist} · {timeLabel(record.duration)} ·{" "}
                             {record.karaoke ? "노래방 모드" : "음악 모드"}
                             {record.reverb ? " · 리버브 ON" : ""}
+                            {record.autoTune ? " · 오토튠 ON" : ""}
                           </p>
                         </div>
                         <button
@@ -1036,18 +1463,18 @@ function HelpDialog({ onClose }) {
             <span>01</span>취향에 맞는 곡을 선택하세요.
           </li>
           <li>
-            <span>02</span>노래방 모드를 켜고 무대를 시작하세요.
+            <span>02</span>노래방 모드를 켜고 마이크 음량을 조절하세요.
           </li>
           <li>
-            <span>03</span>리버브로 나만의 공간감을 더해보세요.
+            <span>03</span>이펙터 버튼을 눌러 실시간 리버브와 오토튠을 경험해 보세요.
           </li>
         </ol>
         <div className="dialog-notice">
           <ShieldCheck size={20} />
           <p>
-            공모전 제출을 위한 인터페이스 데모입니다. 실제 음원 재생, 녹음,
-            마이크 증폭, DSP 및 차량 API 연동은 포함하지 않습니다. 표시된 차량
-            상태도 시연용입니다.
+            Web Audio API 기반 실시간 마이크 증폭 및 DSP 이펙터(리버브, 오토튠)가
+            적용되어 있습니다. 스피커 하울링 방지를 위해 이어폰/헤드폰 사용을
+            권장합니다.
           </p>
         </div>
         <button className="primary-button" onClick={onClose}>
