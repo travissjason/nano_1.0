@@ -13,10 +13,10 @@ export default function AudioPanel({ engine, diagnostics: d }) {
           {d.muted ? "음소거됨 · 재시작 필요" : "긴급 MUTE"}
         </button>
       </div>
-      <p>초기 게인 0.2는 시험 시작값입니다. 모든 환경에서 안전하지 않습니다. 유선 헤드폰으로 먼저 테스트하세요.</p>
+      <p>초기 게인 0.35는 시험 시작값입니다. 모든 환경에서 안전하지 않습니다. 유선 헤드폰으로 먼저 테스트하세요.</p>
       <div className="audio-panel-actions">
         <button type="button" onClick={() => engine.setCaptureSettings({ echoCancellation: true, noiseSuppression: true })}>하울링 억제 우선</button>
-        <button type="button" onClick={() => engine.setCaptureSettings({ echoCancellation: false, noiseSuppression: false })}>음질 우선 · 헤드폰 권장</button>
+        <button type="button" onClick={() => engine.setCaptureSettings({ echoCancellation: false, noiseSuppression: false })}>유선 헤드폰 · 저지연 우선</button>
       </div>
       {[['echoCancellation', '에코 제거(AEC)'], ['noiseSuppression', '잡음 억제']].map(([key, label]) => (
         <label key={key} className="audio-setting">
@@ -27,10 +27,12 @@ export default function AudioPanel({ engine, diagnostics: d }) {
       <p>설정 변경 시 마이크를 중단합니다. 다시 켠 뒤 실제 적용값을 비교하세요. AEC는 음색·음량에 영향을 줄 수 있습니다.</p>
       <label>최종 마이크 출력 <meter min="0" max="1" value={Math.min(1, d.level)} /> RMS {d.level.toFixed(3)} · Peak {d.peak.toFixed(3)}</label>
       <p role="status">{d.warning || '출력 레벨 보호 활성화 시 자동 감쇠합니다. 하울링 감지·완전 제거 기능은 아닙니다.'}</p>
+      <p>목소리가 약 1초 늦으면 블루투스 대신 유선 헤드폰을 연결하고, 위 저지연 우선을 선택한 뒤 노래방을 다시 켜세요. Windows의 ‘이 장치로 듣기’와 다른 마이크 모니터링 앱도 끄세요. 스피커 사용 시에는 하울링 억제 우선을 사용하세요.</p>
       <details>
         <summary>오디오 진단 · {d.status} · {d.mode}</summary>
         <dl>
           <dt>AudioContext</dt><dd>{d.contextState}</dd>
+          <dt>입력 장치 보고 지연</dt><dd>{milliseconds(d.trackSettings.latency)}</dd>
           <dt>sampleRate</dt><dd>{d.sampleRate ?? '미제공'} Hz</dd>
           <dt>baseLatency</dt><dd>{milliseconds(d.baseLatency)}</dd>
           <dt>outputLatency</dt><dd>{milliseconds(d.outputLatency)}</dd>

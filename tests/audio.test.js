@@ -17,7 +17,7 @@ function setup({ deferred = false, denied = false, workletFailure = false } = {}
   };
   const track = { stopped: false, stop() { this.stopped = true; }, getSettings() { return { echoCancellation: true, noiseSuppression: true, autoGainControl: false }; } };
   const stream = { getTracks: () => [track], getAudioTracks: () => [track] };
-  const media = { getSupportedConstraints: () => ({ echoCancellation: true, noiseSuppression: true, autoGainControl: true }),
+  const media = { getSupportedConstraints: () => ({ latency: true, channelCount: true, sampleRate: true, echoCancellation: true, noiseSuppression: true, autoGainControl: true }),
     async getUserMedia(c) { requests++; media.constraints = c; if (denied) throw Object.assign(new Error('denied'), { name: 'NotAllowedError' }); return deferred ? new Promise(r => { release = () => r(stream); }) : stream; },
     addEventListener(_, fn) { media.changed = fn; }, removeEventListener() { media.changed = null; } };
   class Context {
@@ -44,8 +44,11 @@ function setup({ deferred = false, denied = false, workletFailure = false } = {}
 test('native dry route, conservative gain, wet and music paths are separate', async () => {
   const { engine: e, media } = setup();
   assert.equal(await e.startMicrophone(), true);
-  assert.equal(e.micGain.gain.value, 0.2);
+  assert.equal(e.micGain.gain.value, 0.35);
   assert.equal(media.constraints.audio.autoGainControl, false);
+  assert.deepEqual(media.constraints.audio.latency, { ideal: 0.01 });
+  assert.deepEqual(media.constraints.audio.channelCount, { ideal: 1 });
+  assert.deepEqual(media.constraints.audio.sampleRate, { ideal: 48000 });
   assert.deepEqual(e.filter.edges, [e.dry]);
   assert.ok(e.dry.edges.includes(e.micGain));
   assert.ok(e.micGain.edges.includes(e.limiter));
@@ -108,7 +111,7 @@ test('MUTE is latched, device changes stop tracks and clear timers', async () =>
   assert.equal(e.status, 'stopped');
   assert.equal(s.track.stopped, true);
   assert.equal(s.intervals.size, 0);
-  assert.equal(e.gain, 0.2);
+  assert.equal(e.gain, 0.35);
   assert.ok(s.nodes.every(n => n.edges.length === 0));
 });
 

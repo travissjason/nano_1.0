@@ -95,7 +95,7 @@ export default function App() {
   const [playlistTab, setPlaylistTab] = useState("recent");
   const [help, setHelp] = useState(false);
   const [toast, setToast] = useState("");
-  const [volume, setVolume] = useState(20);
+  const [volume, setVolume] = useState(35);
   const toastTimer = useRef();
 
   const engineRef = useRef(null);
@@ -111,7 +111,7 @@ export default function App() {
       setReverb(data.reverb);
       if (data.status === "stopped") {
         setKaraoke(false);
-        setVolume(20);
+        setVolume(35);
         setEffectorOpen(false);
       }
     };
@@ -163,9 +163,9 @@ export default function App() {
   }
 
   async function startMicrophoneEngine() {
-    setVolume(20);
+    setVolume(35);
     const ok = await engine.startMicrophone();
-    if (ok) notify("마이크가 켜졌어요. 초기 게인 0.2 · 유선 헤드폰으로 먼저 테스트하세요.");
+    if (ok) notify("마이크가 켜졌어요. 초기 게인 0.35 · 유선 헤드폰으로 먼저 테스트하세요.");
     return ok;
   }
 

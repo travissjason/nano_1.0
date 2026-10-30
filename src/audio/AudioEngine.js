@@ -9,7 +9,7 @@ export class AudioEngine {
     this.effectSerial = 0;
     this.status = "stopped";
     this.settings = { echoCancellation: true, noiseSuppression: true, autoGainControl: false };
-    this.gain = 0.2;
+    this.gain = 0.35;
     this.musicVolume = 0.5;
     this.reverb = false;
     this.autotune = false;
@@ -46,7 +46,7 @@ export class AudioEngine {
     const serial = ++this.serial;
     this.status = "starting";
     this.warning = "";
-    this.gain = 0.2;
+    this.gain = 0.35;
     this.muted = false;
     this.publish();
     let stream, ctx;
@@ -55,11 +55,15 @@ export class AudioEngine {
       if (!media?.getUserMedia) throw new Error("마이크는 HTTPS 또는 localhost의 지원 브라우저가 필요합니다.");
       const AudioContext = this.platform.AudioContext || this.platform.webkitAudioContext;
       // Resume inside the user gesture, before waiting for permission.
-      ctx = new AudioContext({ latencyHint: "interactive" });
+      ctx = new AudioContext({ latencyHint: "interactive", sampleRate: 48000 });
       this.ctx = ctx;
       if (ctx.state === "suspended") await ctx.resume();
       const supported = this.supportedConstraints();
       const constraints = Object.fromEntries(Object.entries(this.settings).filter(([key]) => supported[key]));
+      // Preferences, not guarantees: inspect getSettings() after capture.
+      if (supported.latency) constraints.latency = { ideal: 0.01 };
+      if (supported.channelCount) constraints.channelCount = { ideal: 1 };
+      if (supported.sampleRate) constraints.sampleRate = { ideal: ctx.sampleRate };
       stream = await media.getUserMedia({ audio: constraints });
       if (serial !== this.serial) {
         stream.getTracks().forEach(track => track.stop());
@@ -119,7 +123,7 @@ export class AudioEngine {
       ctx.onstatechange = () => { if (this.ctx === ctx) this.publish(); };
       this.deviceChanged = () => {
         this.stopMicrophone();
-        this.warning = "오디오 장치 변경: 출력을 중단했습니다. 다시 켜면 게인 0.2로 시작합니다.";
+        this.warning = "오디오 장치 변경: 출력을 중단했습니다. 다시 켜면 게인 0.35로 시작합니다.";
         this.publish();
       };
       media.addEventListener?.("devicechange", this.deviceChanged);
@@ -227,7 +231,7 @@ export class AudioEngine {
     if (this.worklet === node) this.worklet = null;
   }
   setCaptureSettings(settings) {
-    // Never change capture processing while monitoring. Stop first; explicit restart at 0.2.
+    // Never change capture processing while monitoring. Stop first; explicit restart at 0.35.
     this.stopMicrophone();
     this.settings = { ...this.settings, ...settings, autoGainControl: false };
     this.warning = "입력 설정 변경됨: 노래방을 다시 켜 실제 적용값을 확인하세요.";
@@ -270,7 +274,7 @@ export class AudioEngine {
     this.reverb = false;
     this.metrics = null;
     this.protection = null;
-    this.gain = 0.2;
+    this.gain = 0.35;
     this.status = "stopped";
     if (ctx && ctx.state !== "closed") ctx.close().catch(() => {});
     this.publish();
